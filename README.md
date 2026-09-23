@@ -1,7 +1,4 @@
-# Face Tracking Thing (A.K.A. "please just follow me, servo")
-
-A small project where a camera on a little servo pans around to follow *my*
-face — not strangers, not the cat, just people I actually enrolled.
+# Face Tracking
 
 ## The hardware situation
 
