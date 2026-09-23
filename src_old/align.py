@@ -1,11 +1,22 @@
 # src/align.py
 """
-Alignment demo:
-    Haar face detection -> MediaPipe FaceMesh 5pt -> align to 112x112
+Alignment demo using your WORKING pipeline:
+- Haar face detection (fast)
+- MediaPipe FaceMesh -> 5 keypoints (stable)
+- ArcFace-style 5pt alignment -> 112x112 (or any size you set)
+
+This avoids the bug in haar_5pt.py where the aligned window was shown
+only after the loop and using stale variables.
+
+Run:
+    python -m src.align
+
+Keys:
+    q  quit
+    s  save current aligned face to data/debug_aligned/<timestamp>.jpg
 """
-
 from __future__ import annotations
-
+import os
 import time
 from pathlib import Path
 from typing import Tuple
@@ -13,6 +24,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
+# Import from your existing script
 from .haar_5pt import Haar5ptDetector, align_face_5pt
 
 
@@ -32,16 +44,20 @@ def main(
     mirror: bool = True,
 ):
     cap = cv2.VideoCapture(cam_index)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True)
+    det = Haar5ptDetector(
+        min_size=(70, 70),
+        smooth_alpha=0.80,
+        debug=True,
+    )
 
     out_w, out_h = int(out_size[0]), int(out_size[1])
     blank = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
+    # Where to save aligned snapshots
     save_dir = Path("data/debug_aligned")
     save_dir.mkdir(parents=True, exist_ok=True)
 
     last_aligned = blank.copy()
-
     fps_t0 = time.time()
     fps_n = 0
     fps = 0.0
@@ -63,12 +79,15 @@ def main(
         if faces:
             f = faces[0]
 
+            # Draw box + 5 pts
             cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
             for (x, y) in f.kps.astype(int):
                 cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
 
+            # Align (this is the whole point)
             aligned, _M = align_face_5pt(frame, f.kps, out_size=out_size)
 
+            # Keep last good aligned (so window doesn't go black on brief misses)
             if aligned is not None and aligned.size:
                 last_aligned = aligned
 
@@ -76,6 +95,7 @@ def main(
         else:
             _put_text(vis, "no face", (10, 30), 0.9, 2)
 
+        # FPS
         fps_n += 1
         dt = time.time() - fps_t0
         if dt >= 1.0:

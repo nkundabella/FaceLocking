@@ -9,7 +9,7 @@ import time
 
 # Import the face detection class
 try:
-    from src.recognize import HaarFaceMesh5pt
+    from src_old.recognize import HaarFaceMesh5pt
     print("✅ Successfully imported face detection")
 except ImportError as e:
     print(f"❌ Failed to import face detection: {e}")

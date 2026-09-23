@@ -1,38 +1,53 @@
-# src/recognize.py
 """
-Multi-face recognition (CPU-friendly) using your now-stable pipeline:
+Falcon Eye - Face Recognition + Servo Tracker (full-range sweep, direction-following)
 
-Haar (multi-face) -> FaceMesh 5pt (per-face ROI) -> align_face_5pt (112x112)
--> ArcFace ONNX embedding -> cosine distance to DB -> label each face.
+Pipeline:
 
-Includes optional horizontal servo tracking: the primary detected face's
-horizontal position is converted to a servo angle and sent to an ESP8266
-over serial, panning the camera mount to follow the face.
+Camera
+   -> Haar face detection
+   -> MediaPipe FaceLandmarker 5-point landmarks
+   -> 5-point alignment
+   -> ArcFace ONNX embedding
+   -> Face database
+   -> Target / Known-not-target / Stranger
+   -> MQTT
+   -> ESP32
+   -> servo
 
-Run:
-    python -m src.recognize
+Behavior:
 
-Keys:
-    q   : quit
-    r   : reload DB from disk (data/face_database.pkl)
-    +/- : adjust threshold (distance) live
-    d   : toggle debug overlay
-    t   : toggle servo tracking on/off
-
-Notes:
-- We run FaceMesh on EACH Haar face ROI (not the full frame). This avoids the
-  "FaceMesh points not consistent with Haar box" problem and enables multi-face.
-- DB is expected from enroll: data/face_database.pkl (name -> embedding vector)
-- Distance definition: cosine_distance = 1 - cosine_similarity.
-  Since embeddings are L2-normalized, cosine_similarity = dot(a,b).
-- Servo tracking requires pyserial: pip install pyserial
+- Servo starts at HOME_ANGLE (90 degrees).
+- Among the known identities in the database, you pick ONE "target" to
+  follow (TARGET_NAME below, or you'll be prompted at startup).
+- A full search is a continuous sweep across the WHOLE range, in two legs:
+      Leg 1: current angle -> 0 degrees
+      Leg 2: 0 degrees      -> 180 degrees
+  The servo moves in small continuous steps (not big jumps + long holds),
+  checking the camera at every step. Only if BOTH legs complete with no
+  sighting is the target's absence "confirmed" (logged + published over
+  MQTT), and the whole sweep restarts from HOME_ANGLE.
+- If the target is found at any point during a leg, the servo STOPS
+  sweeping and LOCKS on: it actively tracks/follows the target's
+  left-right movement in frame in real time.
+- When the target then disappears from view, Falcon Eye does NOT restart
+  the whole search. It simply resumes the continuous sweep in the exact
+  same direction it was already heading (toward that leg's end angle)
+  from wherever the servo currently is. If it reaches that leg's end
+  angle without finding them again, that direction is confirmed empty
+  and it moves on to the next leg. Only once every direction has been
+  covered without a sighting does it conclude "not there" (absence
+  confirmed).
+- A known face that is NOT the chosen target is reported as "known, not
+  target" and does not cause a lock -- the sweep continues.
+- Any unrecognized face is reported as "Stranger" (console + MQTT + a
+  vivid red on-screen banner).
+- Press 'q' at any time to quit.
 """
+
 from __future__ import annotations
 
-import time
 import json
-import os
-import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -40,73 +55,122 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import onnxruntime as ort
+import paho.mqtt.client as mqtt
 
-try:
-    import mediapipe as mp
-    from mediapipe.tasks import python
-    from mediapipe.tasks.python import vision
-except Exception as e:
-    mp = None
-    _MP_IMPORT_ERROR = e
-
-# Reuse your known-good alignment method (you said alignment is OK now)
-from .haar_5pt import Haar5ptDetector, align_face_5pt
-
-# Optional: pyserial for servo tracking (imported gracefully)
-try:
-    import serial
-    import serial.tools.list_ports
-    _SERIAL_AVAILABLE = True
-except ImportError:
-    _SERIAL_AVAILABLE = False
+from .haar_5pt import align_face_5pt, Haar5ptDetector
 
 
-# -------------------------
-# Servo tracking config
-# -------------------------
-# Serial port and baud rate — must match the ESP8266 sketch
-SERIAL_PORT = "COM3"
-SERIAL_BAUD = 115200
+# ============================================================
+# PATHS
+# ============================================================
 
-# Servo range (degrees)
-SERVO_MIN_ANGLE = 0
-SERVO_MAX_ANGLE = 180
-SERVO_CENTER_ANGLE = 90
+DB_PATH = Path("data/db/face_db.npz")
 
-# Proportional tracking
-# When the face center is at the frame edge (offset = +/-1.0),
-# the servo moves this many degrees from center.
-SERVO_GAIN = 60.0          # max deflection from center (degrees at full offset)
-
-# Deadzone: ignore offsets smaller than this (normalized -1..1 range)
-# Prevents servo jitter when face is nearly centered.
-TRACKING_DEADZONE = 0.03   # ~3% of frame width
-
-# Proportional step: each frame nudges current angle toward target by this fraction
-# of the remaining distance. Lower = smoother but slower; higher = faster but jerkier.
-TRACKING_STEP_ALPHA = 0.35
-
-# Minimum angle change (degrees) before sending to ESP8266.
-# Avoids flooding the serial port with tiny updates.
-SERVO_SEND_THRESHOLD = 2.0
-
-# Frames without a face before holding the last angle
-# (set to 0 to re-center immediately when face is lost)
-TRACKING_LOST_HOLD_FRAMES = 30
+ARC_FACE_MODEL = "models/embedder_arcface.onnx"
 
 
-# -------------------------
-# Data
-# -------------------------
-@dataclass
-class FaceDet:
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-    score: float
-    kps: np.ndarray  # (5,2) float32 in FULL-frame coords
+# ============================================================
+# MQTT CONFIGURATION
+# ============================================================
 
+MQTT_HOST = "broker.benax.rw"
+MQTT_PORT = 1883
+
+TOPIC_SERVO_CMD = "falcon/eye/servo/cmd"
+TOPIC_SERVO_STATUS = "falcon/eye/servo/status"
+TOPIC_RECOGNITION = "falcon/eye/recognition"
+
+
+# ============================================================
+# WHO TO FOLLOW
+# ============================================================
+
+# Set this to a name that exists in your face database to skip the
+# startup prompt (e.g. TARGET_NAME = "Darius"). Leave as None to be
+# prompted with a list of known identities every run.
+TARGET_NAME: Optional[str] = None
+
+
+# ============================================================
+# SERVO / SWEEP CONFIGURATION
+# ============================================================
+
+HOME_ANGLE = 90
+
+# Time to let the servo settle after a large jump (e.g. moving to the
+# start of a new leg).
+SERVO_SETTLE_TIME = 0.8
+
+# Degrees per step while continuously sweeping, and the pause after each
+# small step to let the servo settle before the camera check. Smaller
+# step / longer pause = more thorough but slower; tune for your rig.
+SCAN_STEP_ANGLE = 5
+SCAN_STEP_SETTLE_TIME = 3
+
+# ArcFace acceptance threshold
+DISTANCE_THRESHOLD = 0.5
+
+
+# ============================================================
+# TRACKING CONFIGURATION (following the target while locked on)
+# ============================================================
+
+# Flip to -1 if the servo turns the "wrong way" relative to how the
+# target appears to move in frame (calibrate once for your rig).
+# Confirmed -1 for this rig: with +1, correction nudges kept moving the
+# servo monotonically AWAY from a stationary target (offset never
+# shrank -- it hit TRACK_MAX_STEP every cycle until the target fell out
+# of frame), which is the signature of an inverted feedback loop.
+SERVO_DIRECTION_SIGN = -1
+
+# Degrees of servo movement per full-frame horizontal offset (offset
+# ranges from -1.0 at the left edge to +1.0 at the right edge).
+# Lowered from 25.0: that gain, combined with TRACK_MAX_STEP, was swinging
+# the servo past a stationary face on every correction, which is what was
+# causing the found -> lost -> found cycling.
+TRACK_GAIN = 10.0
+
+# Max degrees the servo is allowed to move in a single tracking nudge,
+# to keep motion smooth instead of jerky.
+TRACK_MAX_STEP = 3.0
+
+# Ignore small offsets near center so the servo doesn't hunt/jitter.
+TRACK_DEADZONE = 0.12
+
+# How often to sample a frame while locked on and tracking (when no
+# nudge was made this cycle -- i.e. you're already centered).
+FRAME_CHECK_INTERVAL = 0.5
+
+# Extra settle time to wait after a nudge before grabbing the next frame.
+# Without this, the camera can still be mid-turn (motion blur / you
+# temporarily out of frame) when the next frame is captured, which reads
+# as a "missed" detection even though you never left.
+TRACK_SETTLE_TIME = 0.5
+
+# How many consecutive missed checks before we consider the target
+# actually gone (rather than a momentary blink/occlusion/settle frame).
+MISSED_CHECKS_BEFORE_LOST = 8
+
+
+# ============================================================
+# CHASE CONFIGURATION (recovering a target that just left frame)
+# ============================================================
+
+# When the target disappears, before falling back to the normal sweep we
+# make a quick, more aggressive push further in the direction they were
+# last drifting -- i.e. the edge of frame they exited from -- since
+# that's the most likely direction they actually walked.
+CHASE_STEP_ANGLE = 8
+CHASE_STEP_SETTLE_TIME = 0.35
+
+# How far past the angle where we lost them we're willing to chase
+# before giving up and declaring them genuinely lost.
+CHASE_MAX_DEGREES = 45
+
+
+# ============================================================
+# MATCH RESULT
+# ============================================================
 
 @dataclass
 class MatchResult:
@@ -116,368 +180,103 @@ class MatchResult:
     accepted: bool
 
 
-# -------------------------
-# Math helpers
-# -------------------------
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+# ============================================================
+# COSINE FUNCTIONS
+# ============================================================
+
+def cosine_similarity(a, b):
     a = a.reshape(-1).astype(np.float32)
     b = b.reshape(-1).astype(np.float32)
     return float(np.dot(a, b))
 
 
-def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+def cosine_distance(a, b):
     return 1.0 - cosine_similarity(a, b)
 
 
-def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, W: int, H: int) -> Tuple[int, int, int, int]:
-    x1 = int(max(0, min(W - 1, round(x1))))
-    y1 = int(max(0, min(H - 1, round(y1))))
-    x2 = int(max(0, min(W - 1, round(x2))))
-    y2 = int(max(0, min(H - 1, round(y2))))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
-    return x1, y1, x2, y2
-
-
-def _bbox_from_5pt(
-    kps: np.ndarray,
-    pad_x: float = 0.55,
-    pad_y_top: float = 0.85,
-    pad_y_bot: float = 1.15,
-) -> np.ndarray:
-    """
-    Build a nicer face-like bbox from 5 points with asymmetric padding.
-    kps: (5,2) in full-frame coords
-    """
-    k = kps.astype(np.float32)
-    x_min = float(np.min(k[:, 0]))
-    x_max = float(np.max(k[:, 0]))
-    y_min = float(np.min(k[:, 1]))
-    y_max = float(np.max(k[:, 1]))
-
-    w = max(1.0, x_max - x_min)
-    h = max(1.0, y_max - y_min)
-
-    x1 = x_min - pad_x * w
-    x2 = x_max + pad_x * w
-    y1 = y_min - pad_y_top * h
-    y2 = y_max + pad_y_bot * h
-
-    return np.array([x1, y1, x2, y2], dtype=np.float32)
-
-
-def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
-    """
-    Minimal geometry sanity:
-    - eyes not collapsed
-    - mouth generally below nose
-    """
-    k = kps.astype(np.float32)
-    le, re, no, lm, rm = k
-    eye_dist = float(np.linalg.norm(re - le))
-    if eye_dist < float(min_eye_dist):
-        return False
-    if not (lm[1] > no[1] and rm[1] > no[1]):
-        return False
-    return True
-
-
-# -------------------------
-# DB helpers
-# -------------------------
-def load_db_pickle(db_path: Path) -> Dict[str, np.ndarray]:
-    if not db_path.exists():
-        return {}
-    try:
-        with open(db_path, "rb") as file:
-            data = pickle.load(file)
-        if not isinstance(data, dict):
-            return {}
-        out: Dict[str, np.ndarray] = {}
-        for name, embedding in data.items():
-            vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
-            norm = float(np.linalg.norm(vector))
-            if norm > 0:
-                out[str(name)] = vector / norm
-        return out
-    except Exception:
-        return {}
-
+# ============================================================
+# FACE DATABASE
+# ============================================================
 
 def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
     if not db_path.exists():
+        print("[DB] Database does not exist:", db_path)
         return {}
-    if db_path.suffix == ".npz":
-        try:
-            data = np.load(str(db_path), allow_pickle=True)
-            out: Dict[str, np.ndarray] = {}
-            for key in data.files:
-                out[key] = np.asarray(data[key], dtype=np.float32).reshape(-1)
-            return out
-        except Exception:
-            return {}
-    return load_db_pickle(db_path)
+
+    data = np.load(str(db_path), allow_pickle=True)
+    out = {}
+
+    for key in data.files:
+        out[key] = np.asarray(data[key], dtype=np.float32).reshape(-1)
+
+    return out
 
 
-# -------------------------
-# Embedder (same as embed_new)
-# -------------------------
+# ============================================================
+# ARC FACE
+# ============================================================
+
 class ArcFaceEmbedderONNX:
-    """
-    ArcFace-style ONNX embedder.
-    Input: 112x112 BGR -> internally RGB + (x-127.5)/128, NCHW float32.
-    Output: (1,D) or (D,)
-    """
-
-    def __init__(
-        self,
-        model_path: str = "models/embedder_arcface.onnx",
-        input_size: Tuple[int, int] = (112, 112),
-        debug: bool = False,
-    ):
+    def __init__(self, model_path=ARC_FACE_MODEL, input_size=(112, 112)):
         self.model_path = model_path
-        self.in_w, self.in_h = int(input_size[0]), int(input_size[1])
-        self.debug = bool(debug)
+        self.in_w = int(input_size[0])
+        self.in_h = int(input_size[1])
 
-        # Check if model file exists
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"ArcFace ONNX model not found at: {model_path}\n"
-                f"You need to obtain an ArcFace ONNX model and place it at this path.\n"
-                f"Common sources:\n"
-                f"- Convert from PyTorch/TensorFlow models\n"
-                f"- Download from ONNX model zoo or similar repositories\n"
-                f"- Use pre-trained models from face recognition libraries"
-            )
+        print("[ArcFace] Loading:", model_path)
 
         self.sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self.in_name = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
 
-        if self.debug:
-            print("[embed] model:", model_path)
-            print("[embed] input:", self.sess.get_inputs()[0].name, self.sess.get_inputs()[0].shape,
-self.sess.get_inputs()[0].type)
-            print("[embed] output:", self.sess.get_outputs()[0].name, self.sess.get_outputs()[0].shape,
-self.sess.get_outputs()[0].type)
+        print("[ArcFace] Input:", self.in_name)
+        print("[ArcFace] Output:", self.out_name)
 
-    def _preprocess(self, aligned_bgr_112: np.ndarray) -> np.ndarray:
-        img = aligned_bgr_112
+    def _preprocess(self, aligned_bgr):
+        img = aligned_bgr
+
         if img.shape[1] != self.in_w or img.shape[0] != self.in_h:
             img = cv2.resize(img, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
         rgb = (rgb - 127.5) / 128.0
-        # Keep NHWC format (batch, height, width, channels) for this model
-        x = rgb[None, ...]  # Add batch dimension: (1, 112, 112, 3)
+        x = np.transpose(rgb, (2, 0, 1))[None, ...]
+
         return x.astype(np.float32)
 
     @staticmethod
-    def _l2_normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-        v = v.astype(np.float32).reshape(-1)
-        n = float(np.linalg.norm(v) + eps)
-        return (v / n).astype(np.float32)
+    def _l2_normalize(vector, eps=1e-12):
+        vector = vector.astype(np.float32).reshape(-1)
+        norm = float(np.linalg.norm(vector) + eps)
+        return (vector / norm).astype(np.float32)
 
-    def embed(self, aligned_bgr_112: np.ndarray) -> np.ndarray:
-        x = self._preprocess(aligned_bgr_112)
-        y = self.sess.run([self.out_name], {self.in_name: x})[0]
-        emb = np.asarray(y, dtype=np.float32).reshape(-1)
-        return self._l2_normalize(emb)
-
-
-# -------------------------
-# Multi-face Haar + FaceMesh(ROI) 5pt
-# -------------------------
-class HaarFaceMesh5pt:
-    def __init__(
-        self,
-        haar_xml: Optional[str] = None,
-        min_size: Tuple[int, int] = (70, 70),
-        debug: bool = False,
-    ):
-        self.debug = bool(debug)
-        self.min_size = tuple(map(int, min_size))
-
-        if haar_xml is None:
-            haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        self.face_cascade = cv2.CascadeClassifier(haar_xml)
-        if self.face_cascade.empty():
-            raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
-
-        if mp is None:
-            raise RuntimeError(
-                f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
-                f"Install: pip install mediapipe"
-            )
-
-        # Create FaceLandmarker using the simpler create_from_model_path method
-        # This will use MediaPipe's default face landmarker model
-        try:
-            self.landmarker = vision.FaceLandmarker.create_from_model_path("")
-        except Exception:
-            # If that fails, try the full options approach with default model
-            try:
-                # Download model if needed - MediaPipe 1.0+ can auto-download
-                import urllib.request
-                import os
-                
-                # Create models directory if it doesn't exist
-                models_dir = "models"
-                if not os.path.exists(models_dir):
-                    os.makedirs(models_dir)
-                
-                model_path = os.path.join(models_dir, "face_landmarker.task")
-                if not os.path.exists(model_path):
-                    print("Downloading face landmarker model...")
-                    model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
-                    urllib.request.urlretrieve(model_url, model_path)
-                    print(f"Model downloaded to {model_path}")
-                
-                base_options = python.BaseOptions(model_asset_path=model_path)
-                options = vision.FaceLandmarkerOptions(
-                    base_options=base_options,
-                    running_mode=vision.RunningMode.IMAGE,
-                    num_faces=1,
-                    min_face_detection_confidence=0.5,
-                    min_face_presence_confidence=0.5,
-                    min_tracking_confidence=0.5
-                )
-                self.landmarker = vision.FaceLandmarker.create_from_options(options)
-            except Exception as e:
-                raise RuntimeError(f"Failed to initialize FaceLandmarker: {e}")
-
-        # 5pt indices for facial landmarks (these correspond to the 468-point model)
-        # Left eye corner, Right eye corner, Nose tip, Left mouth corner, Right mouth corner
-        self.IDX_LEFT_EYE = 33
-        self.IDX_RIGHT_EYE = 263  
-        self.IDX_NOSE_TIP = 1
-        self.IDX_MOUTH_LEFT = 61
-        self.IDX_MOUTH_RIGHT = 291
-
-    def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            flags=cv2.CASCADE_SCALE_IMAGE,
-            minSize=self.min_size,
-        )
-        if faces is None or len(faces) == 0:
-            return np.zeros((0, 4), dtype=np.int32)
-        return faces.astype(np.int32)  # (x,y,w,h)
-
-    def _roi_facemesh_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
-        H, W = roi_bgr.shape[:2]
-        if H < 20 or W < 20:
-            return None
-
-        # Convert BGR to RGB for MediaPipe
-        rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Create MediaPipe Image
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        
-        # Process the image
-        result = self.landmarker.detect(mp_image)
-        
-        if not result.face_landmarks:
-            return None
-
-        # Get the first face's landmarks
-        landmarks = result.face_landmarks[0]
-        
-        # Extract the 5 key points
-        idxs = [self.IDX_LEFT_EYE, self.IDX_RIGHT_EYE, self.IDX_NOSE_TIP, 
-                self.IDX_MOUTH_LEFT, self.IDX_MOUTH_RIGHT]
-        
-        pts = []
-        for i in idxs:
-            landmark = landmarks[i]
-            # Convert normalized coordinates to pixel coordinates
-            pts.append([landmark.x * W, landmark.y * H])
-        
-        kps = np.array(pts, dtype=np.float32)
-
-        # enforce left/right ordering
-        if kps[0, 0] > kps[1, 0]:
-            kps[[0, 1]] = kps[[1, 0]]
-        if kps[3, 0] > kps[4, 0]:
-            kps[[3, 4]] = kps[[4, 3]]
-
-        return kps
-
-    def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
-        H, W = frame_bgr.shape[:2]
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
-        faces = self._haar_faces(gray)
-        if faces.shape[0] == 0:
-            return []
-
-        # sort by area desc, keep top max_faces
-        areas = faces[:, 2] * faces[:, 3]
-        order = np.argsort(areas)[::-1]
-        faces = faces[order][:max_faces]
-
-        out: List[FaceDet] = []
-        for (x, y, w, h) in faces:
-            # expand ROI a bit for FaceMesh stability
-            mx, my = 0.25 * w, 0.35 * h
-            rx1, ry1, rx2, ry2 = _clip_xyxy(x - mx, y - my, x + w + mx, y + h + my, W, H)
-            roi = frame_bgr[ry1:ry2, rx1:rx2]
-
-            kps_roi = self._roi_facemesh_5pt(roi)
-            if kps_roi is None:
-                if self.debug:
-                    print("[recognize] FaceMesh none for ROI -> skip")
-                continue
-
-            # map ROI kps back to full-frame coords
-            kps = kps_roi.copy()
-            kps[:, 0] += float(rx1)
-            kps[:, 1] += float(ry1)
-
-            # sanity: eye distance relative to Haar width
-            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
-                if self.debug:
-                    print("[recognize] 5pt geometry failed -> skip")
-                continue
-
-            # build bbox from kps (centered)
-            bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
-            x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
-
-            out.append(
-                FaceDet(
-                    x1=x1, y1=y1, x2=x2, y2=y2,
-                    score=1.0,
-                    kps=kps.astype(np.float32),
-                )
-            )
-
-        return out
+    def embed(self, aligned_bgr):
+        x = self._preprocess(aligned_bgr)
+        output = self.sess.run([self.out_name], {self.in_name: x})[0]
+        embedding = np.asarray(output, dtype=np.float32).reshape(-1)
+        return self._l2_normalize(embedding)
 
 
-# -------------------------
-# Matcher
-# -------------------------
+# ============================================================
+# FACE DATABASE MATCHER
+# ============================================================
+
 class FaceDBMatcher:
-    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.34):
+    def __init__(self, db: Dict[str, np.ndarray], dist_thresh=DISTANCE_THRESHOLD):
         self.db = db
         self.dist_thresh = float(dist_thresh)
 
-        # pre-stack for speed
-        self._names: List[str] = []
-        self._mat: Optional[np.ndarray] = None
+        self._names = []
+        self._mat = None
         self._rebuild()
 
     def _rebuild(self):
         self._names = sorted(self.db.keys())
+
         if self._names:
-            self._mat = np.stack([self.db[n].reshape(-1).astype(np.float32) for n in self._names], axis=0)
-            # (K,D)
+            self._mat = np.stack(
+                [self.db[name].reshape(-1).astype(np.float32) for name in self._names],
+                axis=0
+            )
         else:
             self._mat = None
 
@@ -485,245 +284,616 @@ class FaceDBMatcher:
         self.db = load_db_npz(path)
         self._rebuild()
 
-    def match(self, emb: np.ndarray) -> MatchResult:
+    def match(self, embedding) -> MatchResult:
         if self._mat is None or len(self._names) == 0:
             return MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
 
-        e = emb.reshape(1, -1).astype(np.float32)  # (1,D)
-        # cosine similarity since both sides are normalized: sim = dot
-        sims = (self._mat @ e.T).reshape(-1)  # (K,)
-        best_i = int(np.argmax(sims))
-        best_sim = float(sims[best_i])
-        best_dist = 1.0 - best_sim
+        e = embedding.reshape(1, -1).astype(np.float32)
+        similarities = (self._mat @ e.T).reshape(-1)
 
-        ok = best_dist <= self.dist_thresh
+        best_i = int(np.argmax(similarities))
+        best_similarity = float(similarities[best_i])
+        best_distance = 1.0 - best_similarity
+
+        accepted = best_distance <= self.dist_thresh
+
         return MatchResult(
-            name=self._names[best_i] if ok else None,
-            distance=float(best_dist),
-            similarity=float(best_sim),
-            accepted=bool(ok),
+            name=self._names[best_i] if accepted else None,
+            distance=best_distance,
+            similarity=best_similarity,
+            accepted=accepted
         )
 
 
-# -------------------------
-# Demo
-# -------------------------
-def main():
-    db_path = Path("data/face_database.pkl")
+# ============================================================
+# MQTT SERVO CONTROLLER
+# ============================================================
 
-    det = HaarFaceMesh5pt(
-        min_size=(70, 70),
-        debug=False,
-    )
-    embedder = ArcFaceEmbedderONNX(
-        model_path="models/embedder_arcface.onnx",
-        input_size=(112, 112),
-        debug=False,
-    )
+class ServoController:
+    def __init__(self):
+        self.connected = False
+        self.last_status = None
+        self.current_angle = HOME_ANGLE  # last angle WE commanded
+        self.actual_angle = HOME_ANGLE   # last angle the ESP32 confirmed reaching
 
-    db = load_db_npz(db_path)
-    matcher = FaceDBMatcher(db=db, dist_thresh=0.40)  # matches similarity > 0.60
+        self.client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+        )
 
-    # --- Servo tracking state ---
-    tracking_enabled = _SERIAL_AVAILABLE
-    ser_conn: Optional["serial.Serial"] = None
-    if _SERIAL_AVAILABLE:
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+
+        print("[MQTT] Connecting to:", MQTT_HOST)
+
+        self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        self.client.loop_start()
+
+        timeout = time.time() + 5
+        while not self.connected and time.time() < timeout:
+            time.sleep(0.05)
+
+        if not self.connected:
+            raise RuntimeError("Could not connect to MQTT broker")
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            self.connected = True
+            print("[MQTT] Connected")
+            client.subscribe(TOPIC_SERVO_STATUS)
+        else:
+            print("[MQTT] Connection failed:", reason_code)
+
+    def _on_message(self, client, userdata, message):
         try:
-            ser_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=2)
-            time.sleep(2)  # ESP8266 resets on serial open; wait for boot
-            print(f"[tracking] Serial opened: {SERIAL_PORT} @ {SERIAL_BAUD}")
-        except serial.SerialException as e:
-            print(f"[tracking] Serial port {SERIAL_PORT} unavailable: {e}")
-            print("[tracking] Tracking disabled. Recognition continues normally.")
-            tracking_enabled = False
-    else:
-        print("[tracking] pyserial not installed. Tracking disabled.")
-        print("[tracking] Install with: pip install pyserial")
+            payload = message.payload.decode()
+            self.last_status = payload
+            print("[ESP]", payload)
 
-    servo_angle = float(SERVO_CENTER_ANGLE)
-    last_sent_angle = -999  # last angle sent to ESP8266 (for threshold check)
-    frames_without_face = 0
-    last_face_time = None
+            # Keep our notion of the PHYSICAL angle in sync with what the
+            # ESP32 actually confirms, rather than trusting the optimistic
+            # angle we set in move_to() the instant we send a command.
+            try:
+                data = json.loads(payload)
+                if data.get("status") == "ANGLE_REACHED" and "angle" in data:
+                    self.actual_angle = int(data["angle"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        except Exception as e:
+            print("[MQTT] Message error:", e)
 
-    cap = cv2.VideoCapture(2)
-    if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+    def move_to(self, angle: float):
+        angle = max(0, min(180, int(round(angle))))
+        self.current_angle = angle
+        command = f"ANGLE:{angle}"
+        self.client.publish(TOPIC_SERVO_CMD, command)
 
-    print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay, t=toggle tracking")
+    def nudge(self, delta_degrees: float):
+        """Move relative to the current angle -- used for live tracking."""
+        self.move_to(self.current_angle + delta_degrees)
 
-    t0 = time.time()
-    frames = 0
-    fps: Optional[float] = None
-    show_debug = False
+    def stop(self):
+        print("[MQTT] -> ESP: STOP")
+        self.client.publish(TOPIC_SERVO_CMD, "STOP")
+
+    def home(self):
+        print("[MQTT] -> ESP: HOME")
+        self.client.publish(TOPIC_SERVO_CMD, "HOME")
+
+    def publish_recognition(self, name, distance, similarity, angle, status="TARGET"):
+        payload = {
+            "name": name,
+            "status": status,
+            "distance": float(distance),
+            "similarity": float(similarity),
+            "angle": int(angle),
+        }
+        self.client.publish(TOPIC_RECOGNITION, json.dumps(payload))
+
+    def publish_not_found(self):
+        payload = {"name": None, "status": "NOT_FOUND"}
+        self.client.publish(TOPIC_RECOGNITION, json.dumps(payload))
+
+    def close(self):
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+# ============================================================
+# FACE ANALYSIS + CLASSIFICATION
+# ============================================================
+
+def analyze_frame(frame, detector, embedder, matcher) -> List[Tuple[object, MatchResult]]:
+    """Returns a list of (face, MatchResult) for every face detected in the frame."""
+    faces = detector.detect(frame, max_faces=5)
+    results = []
+
+    for face in faces:
+        aligned, _ = align_face_5pt(frame, face.kps, out_size=(112, 112))
+        embedding = embedder.embed(aligned)
+        result = matcher.match(embedding)
+        results.append((face, result))
+
+    return results
+
+
+def classify(result: MatchResult, target_name: Optional[str]) -> str:
+    """TARGET / OTHER_KNOWN / STRANGER for a single match result."""
+    if result.accepted and target_name is not None and result.name == target_name:
+        return "TARGET"
+    if result.accepted:
+        return "OTHER_KNOWN"
+    return "STRANGER"
+
+
+def find_target(results, target_name: Optional[str]):
+    """Returns (face, result) for the target if present among results, else None."""
+    if target_name is None:
+        return None
+    for face, result in results:
+        if classify(result, target_name) == "TARGET":
+            return face, result
+    return None
+
+
+def face_offset_normalized(face, frame_w: int) -> float:
+    """Horizontal offset of a face's center from the frame's center, -1 (left) to +1 (right)."""
+    cx = (face.x1 + face.x2) / 2.0
+    offset = (cx - frame_w / 2.0) / (frame_w / 2.0)
+    return float(np.clip(offset, -1.0, 1.0))
+
+
+# ============================================================
+# DRAWING -- vivid status overlays
+# ============================================================
+
+STATUS_COLORS = {
+    "TARGET": (0, 255, 0),
+    "OTHER_KNOWN": (0, 255, 255),
+    "STRANGER": (0, 0, 255),
+}
+
+
+def draw_results(frame, results, target_name: Optional[str]):
+    vis = frame.copy()
+
+    for face, result in results:
+        status = classify(result, target_name)
+        color = STATUS_COLORS[status]
+
+        cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
+        for x, y in face.kps.astype(int):
+            cv2.circle(vis, (int(x), int(y)), 2, color, -1)
+
+        if status == "TARGET":
+            label = f"TARGET: {result.name}"
+        elif status == "OTHER_KNOWN":
+            label = f"KNOWN: {result.name}"
+        else:
+            label = "STRANGER"
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        ty = max(face.y1, th + 10)
+        cv2.rectangle(vis, (face.x1, ty - th - 10), (face.x1 + tw + 8, ty), color, -1)
+        text_color = (0, 0, 0) if status != "STRANGER" else (255, 255, 255)
+        cv2.putText(vis, label, (face.x1 + 4, ty - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+
+    return vis
+
+
+def draw_banner(vis, text: str, color, pulse: bool = False):
+    h, w = vis.shape[:2]
+    bar_h = 46
+
+    overlay = vis.copy()
+    alpha = 0.55 + 0.25 * abs(np.sin(time.time() * 3.0)) if pulse else 0.75
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), color, -1)
+    cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+    cv2.putText(vis, text, (max(10, (w - tw) // 2), bar_h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+    return vis
+
+
+def compute_banner(results, target_name: Optional[str], target_present: bool):
+    """Priority: locked target > stranger present > other known present > searching."""
+    if target_present:
+        return f"TARGET LOCKED: {target_name}", (0, 140, 0), False
+
+    statuses = [classify(r, target_name) for _, r in results]
+
+    if "STRANGER" in statuses:
+        return "STRANGER DETECTED", (0, 0, 200), True
+
+    if "OTHER_KNOWN" in statuses:
+        names = ", ".join(sorted({r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}))
+        return f"KNOWN (not target): {names}", (0, 150, 150), False
+
+    label = f"SEARCHING for {target_name}..." if target_name else "SEARCHING..."
+    return label, (0, 0, 180), True
+
+
+def render_frame(frame, results, target_name, target_present, extra_text=None):
+    vis = draw_results(frame, results, target_name)
+    text, color, pulse = compute_banner(results, target_name, target_present)
+    if extra_text:
+        text = extra_text
+    vis = draw_banner(vis, text, color, pulse=pulse)
+    return vis
+
+
+def process_announcements(results, target_name, servo, angle, state):
+    """
+    Console + MQTT logging for strangers / other known faces, only firing on
+    a NEW sighting (transition into view) so a continuous sweep doesn't spam
+    the same person every step while they stay in frame.
+    """
+    statuses_now = [classify(r, target_name) for _, r in results]
+
+    stranger_now = "STRANGER" in statuses_now
+    if stranger_now and not state["stranger_active"]:
+        r = next(r for f, r in results if classify(r, target_name) == "STRANGER")
+        print(f"[SWEEP] Stranger detected at {angle} degrees (dist={r.distance:.3f})")
+        servo.publish_recognition(name="Stranger", distance=r.distance,
+                                   similarity=r.similarity, angle=angle, status="STRANGER")
+    state["stranger_active"] = stranger_now
+
+    known_now = {r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}
+    for name in known_now - state["known_active"]:
+        r = next(r for f, r in results if r.name == name and classify(r, target_name) == "OTHER_KNOWN")
+        print(f"[SWEEP] Known face (not target) at {angle} degrees: {name}")
+        servo.publish_recognition(name=name, distance=r.distance,
+                                   similarity=r.similarity, angle=angle, status="OTHER_KNOWN")
+    state["known_active"] = known_now
+
+
+# ============================================================
+# CONTINUOUS SWEEP -- one leg (e.g. 90 -> 0, or 0 -> 180)
+# ============================================================
+
+def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
+                            start_angle, end_angle, announce_state) -> Tuple[str, bool]:
+    """
+    Continuously steps the servo from start_angle to end_angle, checking the
+    camera at every step. Returns (outcome, quit_requested) where outcome is
+    "found" (target spotted -- servo stopped at that angle) or
+    "not_found_reached_end" (reached end_angle with no sighting).
+    """
+    direction = 1 if end_angle >= start_angle else -1
+    angle = start_angle
+
+    servo.move_to(angle)
+    time.sleep(SERVO_SETTLE_TIME)
+
+    while True:
+        ok, frame = cap.read()
+
+        if ok:
+            results = analyze_frame(frame, detector, embedder, matcher)
+            target = find_target(results, target_name)
+
+            vis = render_frame(frame, results, target_name, target_present=target is not None,
+                                extra_text=(f"SEARCHING for {target_name}...  ({servo.current_angle}\u00b0)"
+                                            if target_name else None))
+            cv2.imshow("Falcon Eye", vis)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                return "quit", True
+
+            if target is not None:
+                face, result = target
+                print()
+                print("=" * 60)
+                print("TARGET FOUND!")
+                print("Name:", result.name)
+                print("Distance:", f"{result.distance:.3f}")
+                print("Angle:", servo.current_angle)
+                print("=" * 60)
+                servo.publish_recognition(name=result.name, distance=result.distance,
+                                           similarity=result.similarity,
+                                           angle=servo.current_angle, status="TARGET")
+                return "found", False
+
+            process_announcements(results, target_name, servo, servo.current_angle, announce_state)
+
+        if angle == end_angle:
+            break
+
+        angle += direction * SCAN_STEP_ANGLE
+        if (direction > 0 and angle > end_angle) or (direction < 0 and angle < end_angle):
+            angle = end_angle
+
+        servo.move_to(angle)
+        time.sleep(SCAN_STEP_SETTLE_TIME)
+
+    return "not_found_reached_end", False
+
+
+# ============================================================
+# LOCK-ON: WATCH + LIVE TRACKING
+# ============================================================
+
+def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direction_sign) -> str:
+    """
+    The target just left frame. Rather than immediately giving up, keep
+    pushing the servo further in `direction_sign` -- the actual physical
+    direction the servo was already moving during the last successful
+    tracking nudge, not a recomputed sign -- in short steps, checking the
+    camera at each one, for up to CHASE_MAX_DEGREES. This is a guess at
+    where they walked to, based on which way the servo was already
+    heading right before they disappeared.
+
+    Returns "found" (re-acquired -- caller should resume watch_and_track),
+    "not_found" (chase exhausted, genuinely lost), or "quit".
+    """
+    traveled = 0
+    start_angle = servo.current_angle
+
+    print(f"[CHASE] {target_name} left frame near {start_angle} degrees -- "
+          f"chasing toward where they were heading")
+
+    while traveled < CHASE_MAX_DEGREES:
+        prev_angle = servo.current_angle
+        next_angle = prev_angle + direction_sign * CHASE_STEP_ANGLE
+        clamped = max(0, min(180, next_angle))
+
+        servo.move_to(clamped)
+        traveled += abs(clamped - prev_angle)
+        time.sleep(CHASE_STEP_SETTLE_TIME)
+
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        results = analyze_frame(frame, detector, embedder, matcher)
+        target = find_target(results, target_name)
+
+        vis = render_frame(frame, results, target_name, target_present=target is not None,
+                            extra_text=f"CHASING {target_name}...  ({servo.current_angle}\u00b0)")
+        cv2.imshow("Falcon Eye", vis)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            return "quit"
+
+        if target is not None:
+            face, result = target
+            print(f"[CHASE] Re-acquired {target_name} at {servo.current_angle} degrees")
+            return "found"
+
+        # Hit the physical end of travel -- no point continuing this way.
+        if clamped in (0, 180):
+            break
+
+    print(f"[CHASE] Didn't find {target_name} within {CHASE_MAX_DEGREES} degrees of last sighting")
+    return "not_found"
+
+
+def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> bool:
+    """
+    Actively track target_name while visible, nudging the servo to follow
+    their left/right movement in real time. When they leave frame, first
+    chases a short distance further in the direction they were last
+    drifting (the edge of frame they exited from) to try to reacquire
+    them. Only if that chase comes up empty do we give up, log "Lost",
+    and let the caller resume the normal sweep from wherever the servo
+    now sits. Returns quit_requested.
+    """
+    missed = 0
+    last_nudge_direction = 0  # actual physical sign of the last servo move, for chasing
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            break
+            time.sleep(FRAME_CHECK_INTERVAL)
+            continue
 
-        faces = det.detect(frame, max_faces=5)
-        recognized_faces = []
-        vis = frame.copy()
+        frame_w = frame.shape[1]
+        results = analyze_frame(frame, detector, embedder, matcher)
+        target = find_target(results, target_name)
 
-        # compute fps
-        frames += 1
-        dt = time.time() - t0
-        if dt >= 1.0:
-            fps = frames / dt
-            frames = 0
-            t0 = time.time()
-
-        # draw + recognize each face
-        # show aligned thumbnails stacked on the RIGHT, but lower to avoid overlay with green text
-        h, w = vis.shape[:2]
-        thumb = 112
-        pad = 8
-        x0 = w - thumb - pad
-        y0 = 80  # moved down to avoid your text overlay area
-        shown = 0
-
-        for i, f in enumerate(faces):
-            # draw bbox + kps
-            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
-            for (x, y) in f.kps.astype(int):
-                cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
-
-            # align -> embed -> match
-            aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
-            emb = embedder.embed(aligned)
-            mr = matcher.match(emb)
-
-            # label
-            label = mr.name if mr.name is not None else "Unknown"
-            line1 = f"{label}"
-            line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
-
-            # color: known green, unknown red
-            color = (0, 255, 0) if mr.accepted else (0, 0, 255)
-
-            cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            if mr.accepted:
-                recognized_faces.append((f, mr))
-            if y0 + thumb <= h and shown < 4:
-                vis[y0:y0 + thumb, x0:x0 + thumb] = aligned
-                cv2.putText(
-                    vis,
-                    f"{i+1}:{label}",
-                    (x0, y0 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    color,
-                    2,
-                )
-                y0 += thumb + pad
-                shown += 1
-
-            if show_debug:
-                # show kps coords quickly
-                dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
-                cv2.putText(vis, dbg, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # --- Servo tracking: only recognized enrolled faces are tracked ---
-        if tracking_enabled and ser_conn is not None and ser_conn.is_open:
-            if recognized_faces:
-                primary = recognized_faces[0][0]
-                face_center_x = (primary.x1 + primary.x2) / 2.0
-                # Normalize to -1.0 (left edge) .. +1.0 (right edge)
-                offset = (face_center_x - (w / 2.0)) / (w / 2.0)
-                offset = max(-1.0, min(1.0, offset))
-
-                if abs(offset) > TRACKING_DEADZONE:
-                    # Target angle: center + gain * offset
-                    target_angle = SERVO_CENTER_ANGLE - SERVO_GAIN * offset
-                    target_angle = max(float(SERVO_MIN_ANGLE), min(float(SERVO_MAX_ANGLE), target_angle))
-
-                    # Proportional step toward target
-                    servo_angle += TRACKING_STEP_ALPHA * (target_angle - servo_angle)
-                    servo_angle = max(float(SERVO_MIN_ANGLE), min(float(SERVO_MAX_ANGLE), servo_angle))
-
-                frames_without_face = 0
-                last_face_time = time.time()
-            else:
-                now = time.time()
-                if last_face_time is not None and (now - last_face_time) >= 1.0:
-                    servo_angle = float(SERVO_CENTER_ANGLE)
-                    last_sent_angle = -999
-                    last_face_time = None
-                else:
-                    frames_without_face += 1
-
-            # Only send when change exceeds threshold
-            send_angle = int(round(servo_angle))
-
-            if abs(send_angle - last_sent_angle) >= SERVO_SEND_THRESHOLD:
-                try:
-                    ser_conn.write(f"{send_angle}\r\n".encode("ascii"))
-                    ser_conn.flush()
-                    last_sent_angle = send_angle
-                except serial.SerialException:
-                    pass  # don't crash on write failure
-
-            # Draw tracking status on the overlay
-            track_state = f"SERVO {int(servo_angle)} deg" if tracking_enabled else "SERVO OFF"
-            if len(recognized_faces) == 0 and frames_without_face > 0:
-                track_state += f" (holding {frames_without_face}f)"
-            cv2.putText(vis, track_state, (10, h - 45),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-        # overlay header
-        header = f"IDs={len(matcher._names)}  thr(dist)={matcher.dist_thresh:.2f}"
-        if fps is not None:
-            header += f"  fps={fps:.1f}"
-        cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-
-        cv2.imshow("recognize_new", vis)
+        vis = render_frame(frame, results, target_name, target_present=target is not None)
+        cv2.imshow("Falcon Eye", vis)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
-            break
-        elif key == ord("r"):
-            matcher.reload_from(db_path)
-            print(f"[recognize] reloaded DB: {len(matcher._names)} identities")
-        elif key in (ord("+"), ord("=")):
-            matcher.dist_thresh = float(min(1.20, matcher.dist_thresh + 0.01))
-            print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
-        elif key == ord("-"):
-            matcher.dist_thresh = float(max(0.05, matcher.dist_thresh - 0.01))
-            print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
-        elif key == ord("d"):
-            show_debug = not show_debug
-            print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
-        elif key == ord("t"):
-            tracking_enabled = not tracking_enabled
-            if tracking_enabled and ser_conn is None:
-                # Try to open serial if it wasn't available at startup
-                if _SERIAL_AVAILABLE:
-                    try:
-                        ser_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=2)
-                        time.sleep(2)
-                        print(f"[tracking] Serial opened: {SERIAL_PORT} @ {SERIAL_BAUD}")
-                    except serial.SerialException as e:
-                        print(f"[tracking] Cannot open {SERIAL_PORT}: {e}")
-                        tracking_enabled = False
-            print(f"[tracking] {'ENABLED' if tracking_enabled else 'DISABLED'}")
+            return True
 
-    cap.release()
-    cv2.destroyAllWindows()
+        nudged = False
 
-    # Clean up serial connection
-    if ser_conn is not None and ser_conn.is_open:
-        try:
-            # Return servo to center before closing
-            ser_conn.write(f"{SERVO_CENTER_ANGLE}\r\n".encode("ascii"))
-            ser_conn.flush()
-            time.sleep(0.1)
-            ser_conn.close()
-            print("[tracking] Serial closed, servo centered.")
-        except Exception:
-            ser_conn.close()
+        if target is not None:
+            face, result = target
+            missed = 0
 
+            offset = face_offset_normalized(face, frame_w)
+            if abs(offset) > TRACK_DEADZONE:
+                step = float(np.clip(offset * TRACK_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP))
+                prev_angle = servo.current_angle
+                servo.nudge(SERVO_DIRECTION_SIGN * step)
+                nudged = True
+                # Record the servo's ACTUAL resulting direction, not a
+                # recomputed sign -- this is what chase_after_loss will
+                # continue, so it can never disagree with reality (clamping
+                # at 0/180, rounding, etc. all wash out automatically).
+                if servo.current_angle != prev_angle:
+                    last_nudge_direction = 1 if servo.current_angle > prev_angle else -1
+
+        else:
+            missed += 1
+            if missed >= MISSED_CHECKS_BEFORE_LOST:
+                if last_nudge_direction != 0:
+                    outcome = chase_after_loss(cap, detector, embedder, matcher, servo,
+                                                target_name, last_nudge_direction)
+                    if outcome == "quit":
+                        return True
+                    if outcome == "found":
+                        missed = 0
+                        continue  # back into normal tracking above
+
+                print(f"[WATCH] Lost {target_name} -- resuming sweep in the same direction "
+                      f"from {servo.current_angle} degrees")
+                return False
+
+        # If we just moved the servo, give it extra time to physically get
+        # there before the next frame is grabbed -- otherwise the next
+        # frame can be captured mid-turn (blur / momentarily out of frame),
+        # which reads as a false "missed" detection and can spuriously
+        # trip MISSED_CHECKS_BEFORE_LOST even though you never moved.
+        time.sleep(TRACK_SETTLE_TIME if nudged else FRAME_CHECK_INTERVAL)
+
+
+# ============================================================
+# FULL-RANGE SEARCH (both legs -> confirm absence if neither finds them)
+# ============================================================
+
+def run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name) -> bool:
+    """
+    Sweeps the whole 0-180 range in two legs (current -> 0, then 0 -> 180),
+    locking onto and following the target whenever seen. After they
+    disappear, resumes the SAME leg in the SAME direction from wherever the
+    servo currently is, rather than restarting. Only once both legs are
+    covered with no sighting is absence confirmed (published over MQTT).
+    Returns quit_requested.
+    """
+
+    print()
+    print("=" * 60)
+    print(f"STARTING FULL-RANGE SEARCH for {target_name or '(no target selected)'}")
+    print("=" * 60)
+
+    announce_state = {"stranger_active": False, "known_active": set()}
+    legs = [0, 180]
+
+    for leg_end in legs:
+        while True:
+            outcome, quit_requested = continuous_sweep_phase(
+                cap, detector, embedder, matcher, servo, target_name,
+                servo.current_angle, leg_end, announce_state
+            )
+
+            if quit_requested:
+                return True
+
+            if outcome == "not_found_reached_end":
+                print(f"[SWEEP] Reached {leg_end} degrees -- not there in this direction")
+                break
+
+            # outcome == "found" -> lock on and watch until they leave
+            quit_requested = watch_and_track(cap, detector, embedder, matcher, servo, target_name)
+            if quit_requested:
+                return True
+
+            print(f"[SWEEP] Resuming search toward {leg_end} degrees")
+            # loop back: continuous_sweep_phase resumes from servo.current_angle -> leg_end
+
+    servo.publish_not_found()
+    print()
+    print("=" * 60)
+    print("ABSENCE CONFIRMED -- not found across the full range, restarting from home")
+    print("=" * 60)
+
+    return False
+
+
+# ============================================================
+# TARGET SELECTION
+# ============================================================
+
+def select_target(matcher: FaceDBMatcher) -> Optional[str]:
+    if not matcher._names:
+        print("[WARNING] Face database is empty -- nobody to follow.")
+        return None
+
+    if TARGET_NAME:
+        if TARGET_NAME in matcher._names:
+            return TARGET_NAME
+        print(f"[WARN] TARGET_NAME '{TARGET_NAME}' not found in database.")
+
+    print("\nKnown identities in database:")
+    for i, name in enumerate(matcher._names, start=1):
+        print(f"  {i}. {name}")
+
+    while True:
+        choice = input("Who should Falcon Eye follow? (number or name): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(matcher._names):
+            return matcher._names[int(choice) - 1]
+        if choice in matcher._names:
+            return choice
+        print("Invalid choice, try again.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print("=" * 60)
+    print("FALCON EYE FACE RECOGNITION (full-range sweep, direction-following)")
+    print("=" * 60)
+
+    detector = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
+
+    embedder = ArcFaceEmbedderONNX(model_path=ARC_FACE_MODEL, input_size=(112, 112))
+
+    db = load_db_npz(DB_PATH)
+    matcher = FaceDBMatcher(db=db, dist_thresh=DISTANCE_THRESHOLD)
+
+    print("[DB] Identities:", len(matcher._names))
+    if matcher._names:
+        print("[DB] Names:", ", ".join(matcher._names))
+    else:
+        print("[WARNING] Face database is empty!")
+
+    target_name = select_target(matcher)
+    if target_name:
+        print(f"[TARGET] Falcon Eye will follow: {target_name}")
+    else:
+        print("[TARGET] No target -- will only report strangers/known faces, never lock on.")
+
+    servo = ServoController()
+    servo.move_to(HOME_ANGLE)
+    time.sleep(0.5)
+
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        servo.close()
+        raise RuntimeError("Camera not available")
+
+    print()
+    print("Camera ready")
+    print("MQTT ready")
+    print()
+    print("Full-range search starts automatically. Press 'q' in the video window to quit.")
+
+    try:
+        while True:
+            quit_requested = run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name)
+
+            if quit_requested:
+                break
+
+            # absence confirmed across the full range -- return home and
+            # start the whole sweep again automatically
+            servo.move_to(HOME_ANGLE)
+            time.sleep(SERVO_SETTLE_TIME)
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        servo.close()
+
+    print("Falcon Eye stopped.")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()

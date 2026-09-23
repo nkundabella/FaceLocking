@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from src.haar_5pt import Haar5ptDetector, align_face_5pt
-from src.embed import ArcFaceEmbedderONNX
+from src_old.haar_5pt import Haar5ptDetector, align_face_5pt
+from src_old.embed import ArcFaceEmbedderONNX
 
 # For servo tracking
 try:
@@ -106,7 +106,7 @@ class ArcFaceRecognizer:
         print(f"\n[CAPTURE] Enrolling: {name}")
         print("[CAPTURE] USB camera index 2 | SPACE=capture | s=save | q=quit")
         
-        cap = cv2.VideoCapture(2)
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("[ERR] USB camera not available")
             return False
