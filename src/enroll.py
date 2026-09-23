@@ -135,9 +135,13 @@ def main():
     auto = False
     last_auto = 0.0
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera.")
+
+    # Warm up: USB cameras emit black frames until auto-exposure settles
+    for _ in range(30):
+        cap.read()
 
     cv2.namedWindow(cfg.window_main, cv2.WINDOW_NORMAL)
     cv2.namedWindow(cfg.window_aligned, cv2.WINDOW_NORMAL)

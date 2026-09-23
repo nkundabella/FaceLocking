@@ -58,6 +58,7 @@ import onnxruntime as ort
 import paho.mqtt.client as mqtt
 
 from .haar_5pt import align_face_5pt, Haar5ptDetector
+from .face_signals import FaceSignalExtractor, FaceSignals
 
 
 # ============================================================
@@ -405,8 +406,14 @@ class ServoController:
 # FACE ANALYSIS + CLASSIFICATION
 # ============================================================
 
-def analyze_frame(frame, detector, embedder, matcher) -> List[Tuple[object, MatchResult]]:
-    """Returns a list of (face, MatchResult) for every face detected in the frame."""
+def analyze_frame(
+    frame,
+    detector,
+    embedder,
+    matcher,
+    signal_extractor: Optional["FaceSignalExtractor"] = None,
+) -> List[Tuple[object, MatchResult, Optional["FaceSignals"]]]:
+    """Returns a list of (face, MatchResult, FaceSignals|None) for every face detected."""
     faces = detector.detect(frame, max_faces=5)
     results = []
 
@@ -414,7 +421,17 @@ def analyze_frame(frame, detector, embedder, matcher) -> List[Tuple[object, Matc
         aligned, _ = align_face_5pt(frame, face.kps, out_size=(112, 112))
         embedding = embedder.embed(aligned)
         result = matcher.match(embedding)
-        results.append((face, result))
+
+        signals = None
+        if signal_extractor is not None:
+            try:
+                signals = signal_extractor.analyze(
+                    frame, (face.x1, face.y1, face.x2, face.y2)
+                )
+            except Exception:
+                pass
+
+        results.append((face, result, signals))
 
     return results
 
@@ -428,13 +445,27 @@ def classify(result: MatchResult, target_name: Optional[str]) -> str:
     return "STRANGER"
 
 
+def signals_label(signals: Optional["FaceSignals"]) -> str:
+    """Build a compact human-readable annotation from FaceSignals, e.g. 'BLINK | SMILE'."""
+    if signals is None:
+        return ""
+    parts = []
+    if signals.blink:
+        parts.append("BLINK")
+    if signals.eyes_closed:
+        parts.append("EYES CLOSED")
+    if signals.smiling:
+        parts.append("SMILE")
+    return " | ".join(parts)
+
+
 def find_target(results, target_name: Optional[str]):
-    """Returns (face, result) for the target if present among results, else None."""
+    """Returns (face, result, signals) for the target if present among results, else None."""
     if target_name is None:
         return None
-    for face, result in results:
+    for face, result, signals in results:
         if classify(result, target_name) == "TARGET":
-            return face, result
+            return face, result, signals
     return None
 
 
@@ -456,10 +487,16 @@ STATUS_COLORS = {
 }
 
 
+# Indicator colours for facial signals (BGR)
+_SIG_BLINK_COLOR  = (0, 200, 255)   # amber-yellow
+_SIG_CLOSED_COLOR = (0, 100, 255)   # orange
+_SIG_SMILE_COLOR  = (0, 255, 100)   # bright green
+
+
 def draw_results(frame, results, target_name: Optional[str]):
     vis = frame.copy()
 
-    for face, result in results:
+    for face, result, signals in results:
         status = classify(result, target_name)
         color = STATUS_COLORS[status]
 
@@ -480,6 +517,24 @@ def draw_results(frame, results, target_name: Optional[str]):
         text_color = (0, 0, 0) if status != "STRANGER" else (255, 255, 255)
         cv2.putText(vis, label, (face.x1 + 4, ty - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
 
+        # ---- facial-signal indicators below the face box ----
+        if signals is not None:
+            indicators = []
+            if signals.blink:
+                indicators.append(("BLINK", _SIG_BLINK_COLOR))
+            if signals.eyes_closed:
+                indicators.append(("EYES CLOSED", _SIG_CLOSED_COLOR))
+            if signals.smiling:
+                indicators.append(("SMILE", _SIG_SMILE_COLOR))
+
+            iy = face.y2 + 4
+            for text, bg in indicators:
+                (iw, ih), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(vis, (face.x1, iy), (face.x1 + iw + 6, iy + ih + 6), bg, -1)
+                cv2.putText(vis, text, (face.x1 + 3, iy + ih + 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+                iy += ih + 10
+
     return vis
 
 
@@ -498,27 +553,33 @@ def draw_banner(vis, text: str, color, pulse: bool = False):
     return vis
 
 
-def compute_banner(results, target_name: Optional[str], target_present: bool):
+def compute_banner(results, target_name: Optional[str], target_present: bool,
+                   target_signals: Optional["FaceSignals"] = None):
     """Priority: locked target > stranger present > other known present > searching."""
     if target_present:
-        return f"TARGET LOCKED: {target_name}", (0, 140, 0), False
+        sig_text = signals_label(target_signals)
+        base = f"TARGET LOCKED: {target_name}"
+        text = f"{base}  [{sig_text}]" if sig_text else base
+        return text, (0, 140, 0), False
 
-    statuses = [classify(r, target_name) for _, r in results]
+    statuses = [classify(r, target_name) for _, r, _ in results]
 
     if "STRANGER" in statuses:
         return "STRANGER DETECTED", (0, 0, 200), True
 
     if "OTHER_KNOWN" in statuses:
-        names = ", ".join(sorted({r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}))
+        names = ", ".join(sorted({r.name for f, r, _ in results if classify(r, target_name) == "OTHER_KNOWN"}))
         return f"KNOWN (not target): {names}", (0, 150, 150), False
 
     label = f"SEARCHING for {target_name}..." if target_name else "SEARCHING..."
     return label, (0, 0, 180), True
 
 
-def render_frame(frame, results, target_name, target_present, extra_text=None):
+def render_frame(frame, results, target_name, target_present, extra_text=None,
+                 target_signals: Optional["FaceSignals"] = None):
     vis = draw_results(frame, results, target_name)
-    text, color, pulse = compute_banner(results, target_name, target_present)
+    text, color, pulse = compute_banner(results, target_name, target_present,
+                                        target_signals=target_signals)
     if extra_text:
         text = extra_text
     vis = draw_banner(vis, text, color, pulse=pulse)
@@ -531,19 +592,19 @@ def process_announcements(results, target_name, servo, angle, state):
     a NEW sighting (transition into view) so a continuous sweep doesn't spam
     the same person every step while they stay in frame.
     """
-    statuses_now = [classify(r, target_name) for _, r in results]
+    statuses_now = [classify(r, target_name) for _, r, _ in results]
 
     stranger_now = "STRANGER" in statuses_now
     if stranger_now and not state["stranger_active"]:
-        r = next(r for f, r in results if classify(r, target_name) == "STRANGER")
+        r = next(r for f, r, _ in results if classify(r, target_name) == "STRANGER")
         print(f"[SWEEP] Stranger detected at {angle} degrees (dist={r.distance:.3f})")
         servo.publish_recognition(name="Stranger", distance=r.distance,
                                    similarity=r.similarity, angle=angle, status="STRANGER")
     state["stranger_active"] = stranger_now
 
-    known_now = {r.name for f, r in results if classify(r, target_name) == "OTHER_KNOWN"}
+    known_now = {r.name for f, r, _ in results if classify(r, target_name) == "OTHER_KNOWN"}
     for name in known_now - state["known_active"]:
-        r = next(r for f, r in results if r.name == name and classify(r, target_name) == "OTHER_KNOWN")
+        r = next(r for f, r, _ in results if r.name == name and classify(r, target_name) == "OTHER_KNOWN")
         print(f"[SWEEP] Known face (not target) at {angle} degrees: {name}")
         servo.publish_recognition(name=name, distance=r.distance,
                                    similarity=r.similarity, angle=angle, status="OTHER_KNOWN")
@@ -555,7 +616,8 @@ def process_announcements(results, target_name, servo, angle, state):
 # ============================================================
 
 def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
-                            start_angle, end_angle, announce_state) -> Tuple[str, bool]:
+                            start_angle, end_angle, announce_state,
+                            signal_extractor=None) -> Tuple[str, bool]:
     """
     Continuously steps the servo from start_angle to end_angle, checking the
     camera at every step. Returns (outcome, quit_requested) where outcome is
@@ -572,12 +634,14 @@ def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
         ok, frame = cap.read()
 
         if ok:
-            results = analyze_frame(frame, detector, embedder, matcher)
+            results = analyze_frame(frame, detector, embedder, matcher, signal_extractor)
             target = find_target(results, target_name)
 
+            target_signals = target[2] if target is not None else None
             vis = render_frame(frame, results, target_name, target_present=target is not None,
                                 extra_text=(f"SEARCHING for {target_name}...  ({servo.current_angle}\u00b0)"
-                                            if target_name else None))
+                                            if target_name else None),
+                                target_signals=target_signals)
             cv2.imshow("Falcon Eye", vis)
 
             key = cv2.waitKey(1) & 0xFF
@@ -585,13 +649,16 @@ def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
                 return "quit", True
 
             if target is not None:
-                face, result = target
+                face, result, signals = target
+                sig_lbl = signals_label(signals)
                 print()
                 print("=" * 60)
                 print("TARGET FOUND!")
                 print("Name:", result.name)
                 print("Distance:", f"{result.distance:.3f}")
                 print("Angle:", servo.current_angle)
+                if sig_lbl:
+                    print("Signals:", sig_lbl)
                 print("=" * 60)
                 servo.publish_recognition(name=result.name, distance=result.distance,
                                            similarity=result.similarity,
@@ -617,7 +684,8 @@ def continuous_sweep_phase(cap, detector, embedder, matcher, servo, target_name,
 # LOCK-ON: WATCH + LIVE TRACKING
 # ============================================================
 
-def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direction_sign) -> str:
+def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direction_sign,
+                     signal_extractor=None) -> str:
     """
     The target just left frame. Rather than immediately giving up, keep
     pushing the servo further in `direction_sign` -- the actual physical
@@ -649,11 +717,13 @@ def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direc
         if not ok:
             continue
 
-        results = analyze_frame(frame, detector, embedder, matcher)
+        results = analyze_frame(frame, detector, embedder, matcher, signal_extractor)
         target = find_target(results, target_name)
 
+        target_signals = target[2] if target is not None else None
         vis = render_frame(frame, results, target_name, target_present=target is not None,
-                            extra_text=f"CHASING {target_name}...  ({servo.current_angle}\u00b0)")
+                            extra_text=f"CHASING {target_name}...  ({servo.current_angle}\u00b0)",
+                            target_signals=target_signals)
         cv2.imshow("Falcon Eye", vis)
 
         key = cv2.waitKey(1) & 0xFF
@@ -661,7 +731,7 @@ def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direc
             return "quit"
 
         if target is not None:
-            face, result = target
+            face, result, signals = target
             print(f"[CHASE] Re-acquired {target_name} at {servo.current_angle} degrees")
             return "found"
 
@@ -673,7 +743,8 @@ def chase_after_loss(cap, detector, embedder, matcher, servo, target_name, direc
     return "not_found"
 
 
-def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> bool:
+def watch_and_track(cap, detector, embedder, matcher, servo, target_name,
+                    signal_extractor=None) -> bool:
     """
     Actively track target_name while visible, nudging the servo to follow
     their left/right movement in real time. When they leave frame, first
@@ -693,10 +764,12 @@ def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> boo
             continue
 
         frame_w = frame.shape[1]
-        results = analyze_frame(frame, detector, embedder, matcher)
+        results = analyze_frame(frame, detector, embedder, matcher, signal_extractor)
         target = find_target(results, target_name)
 
-        vis = render_frame(frame, results, target_name, target_present=target is not None)
+        target_signals = target[2] if target is not None else None
+        vis = render_frame(frame, results, target_name, target_present=target is not None,
+                           target_signals=target_signals)
         cv2.imshow("Falcon Eye", vis)
 
         key = cv2.waitKey(1) & 0xFF
@@ -706,7 +779,7 @@ def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> boo
         nudged = False
 
         if target is not None:
-            face, result = target
+            face, result, signals = target
             missed = 0
 
             offset = face_offset_normalized(face, frame_w)
@@ -727,7 +800,8 @@ def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> boo
             if missed >= MISSED_CHECKS_BEFORE_LOST:
                 if last_nudge_direction != 0:
                     outcome = chase_after_loss(cap, detector, embedder, matcher, servo,
-                                                target_name, last_nudge_direction)
+                                                target_name, last_nudge_direction,
+                                                signal_extractor=signal_extractor)
                     if outcome == "quit":
                         return True
                     if outcome == "found":
@@ -750,7 +824,8 @@ def watch_and_track(cap, detector, embedder, matcher, servo, target_name) -> boo
 # FULL-RANGE SEARCH (both legs -> confirm absence if neither finds them)
 # ============================================================
 
-def run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name) -> bool:
+def run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name,
+                                  signal_extractor=None) -> bool:
     """
     Sweeps the whole 0-180 range in two legs (current -> 0, then 0 -> 180),
     locking onto and following the target whenever seen. After they
@@ -772,7 +847,8 @@ def run_absence_confirming_search(cap, detector, embedder, matcher, servo, targe
         while True:
             outcome, quit_requested = continuous_sweep_phase(
                 cap, detector, embedder, matcher, servo, target_name,
-                servo.current_angle, leg_end, announce_state
+                servo.current_angle, leg_end, announce_state,
+                signal_extractor=signal_extractor,
             )
 
             if quit_requested:
@@ -783,7 +859,8 @@ def run_absence_confirming_search(cap, detector, embedder, matcher, servo, targe
                 break
 
             # outcome == "found" -> lock on and watch until they leave
-            quit_requested = watch_and_track(cap, detector, embedder, matcher, servo, target_name)
+            quit_requested = watch_and_track(cap, detector, embedder, matcher, servo, target_name,
+                                             signal_extractor=signal_extractor)
             if quit_requested:
                 return True
 
@@ -856,14 +933,34 @@ def main():
     else:
         print("[TARGET] No target -- will only report strangers/known faces, never lock on.")
 
+    # --- Facial signal extractor (blink / eyes-closed / smile) ---
+    signal_extractor: Optional[FaceSignalExtractor] = None
+    try:
+        signal_extractor = FaceSignalExtractor()
+        print("[Signals] Blink / eyes-closed / smile detection: ENABLED")
+    except FileNotFoundError as exc:
+        print(f"[Signals] WARNING: {exc}")
+        print("[Signals] Blink / eyes-closed / smile detection: DISABLED (model missing)")
+    except Exception as exc:
+        print(f"[Signals] WARNING: could not initialise FaceSignalExtractor: {exc}")
+        print("[Signals] Blink / eyes-closed / smile detection: DISABLED")
+
     servo = ServoController()
     servo.move_to(HOME_ANGLE)
     time.sleep(0.5)
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
     if not cap.isOpened():
         servo.close()
+        if signal_extractor is not None:
+            signal_extractor.close()
         raise RuntimeError("Camera not available")
+
+    # Warm up: many USB cameras emit black frames until auto-exposure settles.
+    print("Warming up camera ...", end="", flush=True)
+    for _ in range(30):
+        cap.read()
+    print(" done")
 
     print()
     print("Camera ready")
@@ -873,7 +970,10 @@ def main():
 
     try:
         while True:
-            quit_requested = run_absence_confirming_search(cap, detector, embedder, matcher, servo, target_name)
+            quit_requested = run_absence_confirming_search(
+                cap, detector, embedder, matcher, servo, target_name,
+                signal_extractor=signal_extractor,
+            )
 
             if quit_requested:
                 break
@@ -887,6 +987,8 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         servo.close()
+        if signal_extractor is not None:
+            signal_extractor.close()
 
     print("Falcon Eye stopped.")
 

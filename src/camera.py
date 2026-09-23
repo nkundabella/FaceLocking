@@ -3,7 +3,7 @@ import cv2
 
 
 def main():
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError("Camera not opened. Try changing index (0/1/2).")
 
