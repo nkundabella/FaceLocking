@@ -13,7 +13,8 @@ models/*.task
 data/
 
 # IDE / OS
-.vscode/
 .idea/
 Thumbs.db
 .DS_Store
+config.bat
+node_modules

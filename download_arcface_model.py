@@ -21,8 +21,7 @@ def download_arcface_model():
         return
     
     print("🔍 Searching for available ArcFace models...")
-    
-    # List of potential model sources (in order of preference)
+   
     model_sources = [
         {
             "name": "ArcFace ResNet50 (Hugging Face)",
@@ -57,7 +56,6 @@ def download_arcface_model():
             print(f"    URL: {source['url']}")
             print(f"    Expected size: {source['size_mb']} MB")
             
-            # Download with progress
             def show_progress(block_num, block_size, total_size):
                 if total_size > 0:
                     percent = min(100, (block_num * block_size * 100) / total_size)
